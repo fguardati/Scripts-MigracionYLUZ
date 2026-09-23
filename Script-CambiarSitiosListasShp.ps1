@@ -51,15 +51,15 @@
     de cada usuario que ejecuta el flujo.
 
 .EXAMPLE
-    .\Migrar-DefinicionFlujo.ps1 -RutaDefinicion "C:\Export\Microsoft.Flow\flows\0a1b2c3d-...\definition.json"
+    .\Script-CambiarSitiosListasShp.ps1 -RutaDefinicion "C:\Export\Microsoft.Flow\flows\0a1b2c3d-...\definition.json"
 
     Usa list_mapping.csv con separador ";" y deja new_definition.json junto al original.
 
 .EXAMPLE
-    .\Migrar-DefinicionFlujo.ps1 -RutaDefinicion .\definition.json -RutaMapeo .\mapeos\prod.csv -Separador "," -CarpetaSalida .\salida
+    .\Script-CambiarSitiosListasShp.ps1 -RutaDefinicion .\definition.json -RutaMapeo .\mapeos\prod.csv -Separador "," -CarpetaSalida .\salida
 
 .EXAMPLE
-    .\Migrar-DefinicionFlujo.ps1 -RutaDefinicion .\definition.json -ConvertirInvokerAEmbedded
+    .\Script-CambiarSitiosListasShp.ps1 -RutaDefinicion .\definition.json -ConvertirInvokerAEmbedded
 
     Además de los reemplazos de SharePoint, convierte las conexiones Invoker a Embedded.
 
