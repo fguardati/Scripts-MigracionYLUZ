@@ -11,6 +11,13 @@
       - inputs.parameters.table   (GUID de la lista)  -> GUID destino
       - inputs.parameters.dataset (URL del sitio)     -> sitio destino
 
+    Soporta los dos formatos de acción de conector, que pueden mezclarse en un mismo flujo
+    (el formato se decide por operación según su "type"):
+      - actual  (OpenApiConnection*): sitio y lista en inputs.parameters.dataset / table.
+      - clásico (ApiConnection*, heredado de Logic Apps): sitio y lista embebidos en el
+        string inputs.path, p. ej.
+        /datasets/@{encodeURIComponent(encodeURIComponent('<sitio>'))}/tables/@{encodeURIComponent(encodeURIComponent('<GUID>'))}/items
+
     Pasos:
       0. Valida la estructura del CSV (exactamente 4 campos por registro).
       1. Releva los GUIDs de "table" y los compara contra la columna "GUID origen".
@@ -83,6 +90,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Expresión regular para el formato clásico: captura el sitio y la lista dentro de inputs.path.
+# (?:encodeURIComponent\()+ acepta una o más capas de encodeURIComponent. Lo que queda fuera
+# del match (/items, /items/@{...}/attachments, /onnewitems, etc.) no se modifica.
+$PatronPathClasico = @'
+(?<pre>/datasets/@\{(?:encodeURIComponent\()+')(?<site>[^']*)(?<mid>'\)+\}/tables/@\{(?:encodeURIComponent\()+')(?<table>[^']*)(?<post>'\)+\})
+'@.Trim()
 
 #region Utilidades de consola y acceso a datos
 
@@ -261,6 +275,103 @@ function Test-EsOperacionSharePoint($Accion, [string[]]$ReferenciasSP) {
     return ($conexion -and $ReferenciasSP -contains $conexion)
 }
 
+# Clasifica una acción según su "type":
+#   'clásico' -> ApiConnection, ApiConnectionWebhook, ApiConnectionNotification
+#   'actual'  -> OpenApiConnection, OpenApiConnectionWebhook, OpenApiConnectionNotification
+#   $null     -> no es una operación de conector (sus acciones internas se recorren igual)
+function Get-FormatoOperacion($Accion) {
+    $tipo = Get-Propiedad $Accion 'type'
+    if (@('ApiConnection', 'ApiConnectionWebhook', 'ApiConnectionNotification') -contains $tipo) { return 'clásico' }
+    if (@('OpenApiConnection', 'OpenApiConnectionWebhook', 'OpenApiConnectionNotification') -contains $tipo) { return 'actual' }
+    return $null
+}
+
+# Indica si una operación en formato clásico usa el conector de SharePoint:
+#   1. Extrae CLAVE de host.connection.name = @parameters('$connections')['CLAVE']['connectionId'].
+#   2. Es SharePoint si properties.connectionReferences.CLAVE tiene apiName = "sharepointonline".
+#   3. Respaldo, si la referencia no se puede resolver: host.api.runtimeUrl termina en "/sharepointonline".
+function Test-EsSharePointClasico($Accion, $ReferenciasConexion) {
+    $hostAccion = Get-Propiedad (Get-Propiedad $Accion 'inputs') 'host'
+    $nombreConexion = Get-Propiedad (Get-Propiedad $hostAccion 'connection') 'name'
+    if ($nombreConexion -is [string] -and
+        $nombreConexion -match '^@parameters\(''\$connections''\)\[''(?<clave>[^'']+)''\]\[''connectionId''\]$') {
+        $apiName = Get-Propiedad (Get-Propiedad $ReferenciasConexion $Matches['clave']) 'apiName'
+        if ($apiName) { return ($apiName -eq 'sharepointonline') }
+    }
+    $runtimeUrl = Get-Propiedad (Get-Propiedad $hostAccion 'api') 'runtimeUrl'
+    return ($runtimeUrl -is [string] -and $runtimeUrl -like '*/sharepointonline')
+}
+
+# Construye el registro de una operación de SharePoint (o $null si la acción no lo es),
+# extrayendo sitio y lista según el formato. "Estado" indica si se puede procesar:
+#   OK          -> GUID de lista válido; se compara contra el mapeo y se reemplaza
+#   NoGuid      -> "table" literal que no es un GUID (p. ej. nombre de la lista)
+#   SinTabla    -> la operación no referencia una lista (sin "table" / path sin /datasets/)
+#   Vacio       -> sitio o lista vacíos
+#   Dinamico    -> sitio o lista calculados con una expresión
+#   SinTables   -> (clásico) path con /datasets/ pero sin /tables/
+#   Incoherente -> la estructura no coincide con el tipo (sin inputs.path / inputs.parameters)
+# Solo las operaciones con Estado = OK llevan Guid, así que las demás no cuentan como
+# faltantes ni se modifican.
+function Get-OperacionSharePoint($Item, [string[]]$ReferenciasSP, $ReferenciasConexion) {
+    $accion  = $Item.Accion
+    $formato = Get-FormatoOperacion $accion
+    if (-not $formato) { return $null }
+
+    $esSharePoint = if ($formato -eq 'clásico') { Test-EsSharePointClasico $accion $ReferenciasConexion }
+                    else { Test-EsOperacionSharePoint $accion $ReferenciasSP }
+    if (-not $esSharePoint) { return $null }
+
+    $op = [pscustomobject]@{
+        Nombre     = $Item.Nombre
+        Ruta       = $Item.Ruta
+        Tipo       = $Item.Tipo
+        Formato    = $formato
+        Accion     = $accion       # referencia al objeto en memoria, se modifica en el paso 3
+        Parametros = $null
+        TieneTabla = $false
+        Tabla      = $null
+        Sitio      = $null
+        Guid       = $null
+        Estado     = 'OK'
+    }
+    $inputs = Get-Propiedad $accion 'inputs'
+
+    if ($formato -eq 'clásico') {
+        $path = Get-Propiedad $inputs 'path'
+        if ($path -isnot [string]) { $op.Estado = 'Incoherente'; return $op }
+
+        if ($path -notlike '*/datasets/*') { $op.Estado = 'SinTabla'; return $op }
+        if ($path -notlike '*/tables/*')   { $op.Estado = 'SinTables'; $op.Sitio = $path; return $op }
+
+        $m = [regex]::Match($path, $PatronPathClasico)
+        if (-not $m.Success) { $op.Estado = 'Dinamico'; $op.Sitio = $path; return $op }
+
+        $op.TieneTabla = $true
+        $op.Sitio = $m.Groups['site'].Value
+        $op.Tabla = $m.Groups['table'].Value
+    }
+    else {
+        $parametros = Get-Propiedad $inputs 'parameters'
+        if ($parametros -isnot [System.Management.Automation.PSCustomObject]) { $op.Estado = 'Incoherente'; return $op }
+
+        $op.Parametros = $parametros
+        $op.TieneTabla = ($null -ne $parametros.PSObject.Properties['table'])
+        $op.Tabla      = Get-Propiedad $parametros 'table'
+        $op.Sitio      = Get-Propiedad $parametros 'dataset'
+        if (-not $op.TieneTabla) { $op.Estado = 'SinTabla'; return $op }
+    }
+
+    # Casos especiales comunes a ambos formatos
+    $valores = @($op.Sitio, $op.Tabla) | Where-Object { $_ -is [string] }
+    if (@($valores | Where-Object { $_.Trim() -eq '' }).Count -gt 0) { $op.Estado = 'Vacio'; return $op }
+    if (@($valores | Where-Object { $_.StartsWith('@') }).Count -gt 0) { $op.Estado = 'Dinamico'; return $op }
+
+    $op.Guid = ConvertTo-GuidNormalizado $op.Tabla
+    if (-not $op.Guid) { $op.Estado = 'NoGuid' }
+    return $op
+}
+
 # Recorre recursivamente una colección de acciones (o triggers) y agrega a $Resultado cada
 # una con su nombre, ubicación y tipo. Desciende en:
 #   actions (Ámbito, Aplicar a cada uno, Hasta, rama "Sí" de Condición),
@@ -309,21 +420,11 @@ function Get-TodasLasAcciones($Raiz) {
 # operaciones junto con la lista de GUIDs (distintos) que no están en el mapeo.
 function Get-RelevamientoGuids($Raiz, $Acciones, [hashtable]$Mapeo) {
     $refsSP      = Get-ReferenciasSharePoint $Raiz
+    $refsConexion = Get-Propiedad (Get-Propiedad $Raiz 'properties') 'connectionReferences'
     $operaciones = New-Object System.Collections.Generic.List[object]
     foreach ($a in $Acciones) {
-        if (-not (Test-EsOperacionSharePoint $a.Accion $refsSP)) { continue }
-        $parametros = Get-Propiedad (Get-Propiedad $a.Accion 'inputs') 'parameters'
-        if ($parametros -isnot [System.Management.Automation.PSCustomObject]) { continue }
-        $tabla = Get-Propiedad $parametros 'table'
-        $operaciones.Add([pscustomobject]@{
-            Nombre     = $a.Nombre
-            Ruta       = $a.Ruta
-            Tipo       = $a.Tipo
-            Parametros = $parametros   # referencia al objeto en memoria, se modifica en el paso 3
-            TieneTabla = ($null -ne $parametros.PSObject.Properties['table'])
-            Tabla      = $tabla
-            Guid       = ConvertTo-GuidNormalizado $tabla
-        })
+        $op = Get-OperacionSharePoint $a $refsSP $refsConexion
+        if ($op) { $operaciones.Add($op) }
     }
 
     $faltantes = New-Object System.Collections.Generic.List[string]
@@ -335,19 +436,38 @@ function Get-RelevamientoGuids($Raiz, $Acciones, [hashtable]$Mapeo) {
     foreach ($op in $conGuid) {
         $ubicacion = if ($op.Ruta -ne $op.Nombre) { "  (en: $($op.Ruta))" } else { '' }
         if ($Mapeo.ContainsKey($op.Guid)) {
-            Write-Host ("  [MAPEADO]    {0}  {1}: {2}  -> lista '{3}'{4}" -f $op.Guid, $op.Tipo, $op.Nombre, $Mapeo[$op.Guid].NombreLista, $ubicacion) -ForegroundColor Green
+            Write-Host ("  [MAPEADO]    {0}  {1} ({5}): {2}  -> lista '{3}'{4}" -f $op.Guid, $op.Tipo, $op.Nombre, $Mapeo[$op.Guid].NombreLista, $ubicacion, $op.Formato) -ForegroundColor Green
         }
         else {
-            Write-Host ("  [SIN MAPEO]  {0}  {1}: {2}{3}" -f $op.Guid, $op.Tipo, $op.Nombre, $ubicacion) -ForegroundColor Yellow
+            Write-Host ("  [SIN MAPEO]  {0}  {1} ({4}): {2}{3}" -f $op.Guid, $op.Tipo, $op.Nombre, $ubicacion, $op.Formato) -ForegroundColor Yellow
             if (-not $faltantes.Contains($op.Guid)) { $faltantes.Add($op.Guid) }
         }
     }
 
-    # Operaciones de SharePoint cuyo "table" no es un GUID literal (expresión, nombre de lista, etc.)
-    foreach ($op in @($operaciones | Where-Object { $_.TieneTabla -and -not $_.Guid })) {
-        Write-Aviso ("{0} '{1}': 'table' no es un GUID ('{2}'); no se reemplazará. Revisar manualmente." -f $op.Tipo, $op.Ruta, $op.Tabla)
+    # Operaciones de SharePoint que no se procesan: se advierten y no se modifican
+    foreach ($op in @($operaciones | Where-Object { $_.Estado -notin 'OK', 'SinTabla' })) {
+        $prefijo = "{0} '{1}' (formato {2})" -f $op.Tipo, $op.Ruta, $op.Formato
+        switch ($op.Estado) {
+            'NoGuid' {
+                Write-Aviso ("{0}: 'table' no es un GUID ('{1}'); no se reemplazará. Revisar manualmente." -f $prefijo, $op.Tabla)
+            }
+            'Incoherente' {
+                $esperado = if ($op.Formato -eq 'clásico') { 'inputs.path' } else { 'inputs.parameters' }
+                Write-Aviso ("{0}: el tipo '{1}' debería tener {2} y no lo tiene; no se procesa." -f $prefijo, $op.Accion.type, $esperado)
+            }
+            'Vacio' {
+                Write-Aviso ("{0}: el sitio o la lista están vacíos (sitio = '{1}', lista = '{2}'); no se procesa." -f $prefijo, $op.Sitio, $op.Tabla)
+            }
+            'Dinamico' {
+                $valor = if ($op.Formato -eq 'clásico') { "path = $($op.Sitio)" } else { "dataset = '$($op.Sitio)', table = '$($op.Tabla)'" }
+                Write-Aviso ("{0}: valor dinámico, revisar manualmente ({1})." -f $prefijo, $valor)
+            }
+            'SinTables' {
+                Write-Aviso ("{0}: el path tiene /datasets/ pero no /tables/ (p. ej. HTTP u operación de archivos); revisar manualmente (path = {1})." -f $prefijo, $op.Sitio)
+            }
+        }
     }
-    $sinTabla = @($operaciones | Where-Object { -not $_.TieneTabla }).Count
+    $sinTabla = @($operaciones | Where-Object { $_.Estado -eq 'SinTabla' }).Count
     if ($sinTabla -gt 0) {
         Write-Host ("  Info: {0} operación(es) de SharePoint sin parámetro 'table' (p. ej. HTTP a SharePoint); no se modifican." -f $sinTabla) -ForegroundColor DarkGray
     }
@@ -450,8 +570,36 @@ function New-MapeoPendiente([string]$RutaMapeo, [string]$Separador, [string[]]$F
 function Update-ReferenciasSharePoint($Operaciones, [hashtable]$Mapeo) {
     $cambios = New-Object System.Collections.Generic.List[object]
 
+    # Formato clásico: reconstruye cada match como pre + sitio destino + mid + GUID destino + post,
+    # tomando sitio y GUID de la fila del mapeo cuyo GUID origen coincide con el grupo "table".
+    $evaluador = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $guid = ConvertTo-GuidNormalizado $m.Groups['table'].Value
+        if (-not $guid -or -not $Mapeo.ContainsKey($guid)) { return $m.Value }
+        $filaMapeo = $Mapeo[$guid]
+        return $m.Groups['pre'].Value + $filaMapeo.SitioDestino + $m.Groups['mid'].Value + $filaMapeo.GuidDestino + $m.Groups['post'].Value
+    }
+
     foreach ($op in @($Operaciones | Where-Object { $_.Guid -and $Mapeo.ContainsKey($_.Guid) })) {
         $fila   = $Mapeo[$op.Guid]
+
+        if ($op.Formato -eq 'clásico') {
+            $inputs = $op.Accion.inputs
+            $inputs.path = [regex]::Replace($inputs.path, $PatronPathClasico, $evaluador)
+            $cambios.Add([pscustomobject]@{
+                Tipo            = $op.Tipo
+                Nombre          = $op.Nombre
+                Ruta            = $op.Ruta
+                Lista           = $fila.NombreLista
+                TablaAnterior   = $op.Tabla
+                TablaNueva      = $fila.GuidDestino
+                DatasetAnterior = $op.Sitio
+                DatasetNuevo    = $fila.SitioDestino
+            })
+            continue
+        }
+
+        # Formato actual: asignación directa de inputs.parameters.dataset / table
         $params = $op.Parametros
 
         $tablaAnterior = $params.table
@@ -463,11 +611,8 @@ function Update-ReferenciasSharePoint($Operaciones, [hashtable]$Mapeo) {
             $params | Add-Member -NotePropertyName 'dataset' -NotePropertyValue $fila.SitioDestino
             Write-Aviso ("{0} '{1}': no tenía 'dataset'; se agregó con el sitio destino." -f $op.Tipo, $op.Ruta)
         }
-        elseif ($datasetAnterior -is [string] -and $datasetAnterior.StartsWith('@')) {
-            # El sitio viene de una expresión (p. ej. variable de entorno): se respeta.
-            Write-Aviso ("{0} '{1}': 'dataset' es una expresión ({2}); se mantiene sin cambios." -f $op.Tipo, $op.Ruta, $datasetAnterior)
-        }
         else {
+            # Un 'dataset' dinámico (que empieza con '@') ya se descartó en el paso 1 (Estado = Dinamico).
             $params.dataset = $fila.SitioDestino
         }
 

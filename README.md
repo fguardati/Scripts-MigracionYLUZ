@@ -12,11 +12,32 @@ Trabaja sobre el archivo `definition.json` del paquete y genera un `new_definiti
 
 | Qué cambia | Dónde | Con qué valor |
 |---|---|---|
-| GUID de la lista o biblioteca | `inputs.parameters.table` de cada operación de SharePoint | "GUID destino" del mapeo |
-| URL del sitio | `inputs.parameters.dataset` de esa misma operación | "sitio destino" del mapeo |
+| GUID de la lista o biblioteca | `table` de cada operación de SharePoint (ver formatos abajo) | "GUID destino" del mapeo |
+| URL del sitio | `dataset` de esa misma operación | "sitio destino" del mapeo |
 | Conexiones "Invoker" *(opcional)* | `connectionReferences.*.source` y `inputs.authentication` | `Embedded` y `@parameters('$authentication')` |
 
 Recorre el trigger y todas las acciones, incluidas las anidadas en Ámbitos, Condiciones (ramas Sí y No), Switch (casos y predeterminado), Aplicar a cada uno y Hasta.
+
+### Formatos de acción soportados
+
+Las operaciones de conector pueden aparecer en dos formatos, y **un mismo flujo puede mezclarlos**. El script decide el formato de cada operación según su campo `type`:
+
+| Formato | `type` | Dónde están el sitio y la lista |
+|---|---|---|
+| **Actual** | `OpenApiConnection`, `OpenApiConnectionWebhook`, `OpenApiConnectionNotification` | `inputs.parameters.dataset` e `inputs.parameters.table` |
+| **Clásico** (heredado de Logic Apps) | `ApiConnection`, `ApiConnectionWebhook`, `ApiConnectionNotification` | Dentro del texto de `inputs.path` |
+
+Ejemplo de `inputs.path` en formato clásico:
+
+```
+/datasets/@{encodeURIComponent(encodeURIComponent('https://ypf.sharepoint.com/sites/YLuz.GPFC/BO'))}/tables/@{encodeURIComponent(encodeURIComponent('5fd4052a-2580-4a6b-8790-45f2ef4ef87f'))}/items
+```
+
+- **Formato clásico:** el script reemplaza solo el sitio y el GUID que están entre comillas. Acepta una o más capas de `encodeURIComponent`. El resto del path (`/items`, `/items/@{...}/attachments`, `/onnewitems`, etc.) no se modifica.
+- **Cómo se reconoce SharePoint:**
+  - En el formato actual, por `host.apiId`.
+  - En el formato clásico, por la referencia de conexión de `host.connection.name` (`apiName = sharepointonline`). Si no se puede resolver, por `host.api.runtimeUrl`.
+- **Otros tipos de acción** (Compose, Condición, Ámbito, etc.) no se procesan, pero sus acciones internas sí se recorren.
 
 **Nunca modifica** el `definition.json` ni el `list_mapping.csv` originales.
 
@@ -90,9 +111,9 @@ El script ejecuta estos pasos en orden y se detiene ante el primer problema:
 | Paso | Qué hace | Si hay un problema |
 |---|---|---|
 | **0. Validación del CSV** | Cuenta los campos de cada línea y valida GUIDs, URLs y duplicados | Muestra la línea y el error. Cancela sin generar archivos |
-| **1. Relevamiento** | Lista cada GUID encontrado, en qué acción está y si está mapeado. Detecta conexiones Invoker | — |
+| **1. Relevamiento** | Lista cada GUID encontrado, en qué acción está, su formato (clásico o actual) y si está mapeado. Detecta conexiones Invoker | Advierte las operaciones que no se pueden procesar ([ver advertencias](#advertencias-que-puede-mostrar-el-script)) |
 | **2. GUIDs faltantes** | Genera `list_mapping_pendiente.csv`: una copia del mapeo con una línea `;<guid>;;` por cada GUID faltante | Cancela sin generar `new_definition.json` |
-| **3. Generación** | Reemplaza `table` y `dataset` (y las conexiones Invoker, si se indicó) y guarda `new_definition.json` | — |
+| **3. Generación** | Reemplaza el sitio y la lista (en `parameters` o en `path`, según el formato), y las conexiones Invoker si se indicó, y guarda `new_definition.json` | — |
 
 Si se generó el archivo de pendientes: completá `nombre_lista`, `GUID destino` y `sitio destino` en las líneas nuevas, reemplazá con él el `list_mapping.csv` y volvé a ejecutar.
 
@@ -153,12 +174,17 @@ Completá el [checklist de la sección 8](#8-checklist-posterior-a-la-importaci�
 
 ### Advertencias que puede mostrar el script
 
+Las advertencias sobre operaciones indican el nombre de la acción, su ubicación y su formato. **Salvo la de vistas** (que aparece en el paso 3, sobre operaciones que sí se modifican), **la operación advertida no se modifica y su GUID no cuenta como faltante**, es decir, no se agrega a `list_mapping_pendiente.csv`.
+
 | Advertencia | Qué hacer |
 |---|---|
-| `'table' no es un GUID` | La lista se referencia por nombre o por una expresión. Revisarla a mano en el flujo importado |
-| `'dataset' es una expresión` | El sitio viene de una variable o un parámetro. Se reemplaza el `table` pero el sitio queda como está. Verificar que la expresión resuelva al sitio destino |
+| `'table' no es un GUID` | La lista se referencia con un texto literal que no es un GUID, por ejemplo su nombre. Revisarla a mano en el flujo importado |
+| `valor dinámico, revisar manualmente` | El sitio o la lista se calculan con una expresión, por ejemplo `@parameters('Sitio')` o `encodeURIComponent(variables('Lista'))`. Verificar que la expresión resuelva al sitio y a la lista de destino |
+| `el sitio o la lista están vacíos` | `dataset` o `table` vacíos, o `''` en el path. Completarlos a mano en el flujo importado |
+| `el path tiene /datasets/ pero no /tables/` | Operación clásica que no referencia una lista, como una solicitud HTTP o algunas operaciones de archivos. Revisar el sitio a mano |
+| `el tipo '...' debería tener inputs.path / inputs.parameters` | La estructura no coincide con el tipo de la acción. Revisar la acción en el flujo de origen |
 | `usa una vista (view = ...)` | El GUID de la vista es distinto en destino. Volver a elegir la vista en la acción |
-| `operación(es) de SharePoint sin parámetro 'table'` | Por ejemplo "Enviar solicitud HTTP a SharePoint". Revisar la URI a mano |
+| `operación(es) de SharePoint sin parámetro 'table'` | Operaciones que no referencian una lista: en formato actual, sin `table` (por ejemplo "Enviar solicitud HTTP a SharePoint"); en formato clásico, con un path sin `/datasets/`. Revisarlas a mano |
 
 ---
 
